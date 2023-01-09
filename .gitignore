@@ -1,0 +1,7 @@
+.vscode
+node_modules
+
+
+/list.ts
+/list-private.ts
+/vars.ts
