@@ -1,9 +1,10 @@
-//!node-ext: install sqlite3
+//!node-ext: install dateformat
 
 import { recreateAndSync, RecreateOptions, setSyncConfigs, syncCmd } from "./sync-sessions"
 import { run as runCmd, parseOptions } from "@node-ext/cmd"
 import { resolveShellPath } from "@node-ext/env"
 import path = require("path")
+import dateFormat from 'dateformat'
 
 import syncConfigs from "./list"
 import privateSyncConfigs from "./list-private"
@@ -115,6 +116,7 @@ async function run() {
                 throw new Error(`please use \`nx-sync ${useCmd} ${args.join(" ")}\` instead for ${actualMode}`)
             }
         }
+        console.log(`[${dateFormat(new Date(), "yyyy-mm-dd h:MM:ss")}] sync begin`)
         await recreateAndSync(groups, { debug, forceUnlock: force, pause, mode: actualMode })
         console.log("done")
     } else if (["terminate", "resume", "list", "pause", "show"].includes(cmd)) {

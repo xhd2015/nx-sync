@@ -253,7 +253,7 @@ function formatCreateSyncCommand(actualName: string, srcDir: string, dstDir: str
     }
   }
   // mutagen sync create --sync-mode=two-way-resolved \
-  //     --name=sync-pricing-center \
+  //     --name=sync-x-y \
   //     --default-owner-alpha=xhd2015 \
   //     --default-group-alpha=staff \
   //     --default-owner-beta=X \
