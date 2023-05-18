@@ -1,6 +1,7 @@
 //!node-ext: install dateformat
+//!node-ext: install moment
 
-import { recreateAndSync, RecreateOptions, setSyncConfigs, syncCmd } from "./sync-sessions"
+import { recreateAndSync, RecreateOptions, sessionOperation, sessionStatus, setSyncConfigs, syncCmd } from "./sync-sessions"
 import { run as runCmd, parseOptions } from "@node-ext/cmd"
 import { resolveShellPath } from "@node-ext/env"
 import path = require("path")
@@ -20,6 +21,12 @@ Usage: nx-sync flush working
        nx-sync resume <names>
        nx-sync list <names>
        nx-sync show <names>
+
+       nx-sync session upload <names>
+       nx-sync session download <names>
+       nx-sync session status
+
+A special name 'all' can be used to reference all configured names.
 
 Options:
   -h, --help               help
@@ -65,13 +72,14 @@ export interface Options {
     "alpha-to-beta"?: boolean
     "safe"?: boolean
     "mode"?: RecreateOptions["mode"]
+    renew?: boolean
 }
 
 async function run() {
     await init()
 
     // argv: [node, sync.js, ...]
-    const { args: [cmd, ...args], options } = parseOptions<Options>(help, "h,help x,debug f,force pause a,alpha-to-beta=mode  A,alpha-replica=mode b,beta-to-alpha=mode B,beta-replica=mode s,safe=mode")
+    const { args: [cmd, ...args], options } = parseOptions<Options>(help, "h,help x,debug f,force pause a,alpha-to-beta=mode  A,alpha-replica=mode b,beta-to-alpha=mode B,beta-replica=mode s,safe=mode renew")
     const { debug, force, pause, mode } = options
     if (!cmd) {
         throw new Error("requires cmd")
@@ -119,6 +127,23 @@ async function run() {
         console.log(`[${dateFormat(new Date(), "yyyy-mm-dd h:MM:ss")}] sync begin`)
         await recreateAndSync(groups, { debug, forceUnlock: force, pause, mode: actualMode })
         console.log("done")
+    } else if (cmd === 'session') {
+        const [sessionCmd, ...groups] = args
+        if (sessionCmd === 'status') {
+            await sessionStatus()
+            return
+        }
+        if (sessionCmd !== 'download' && sessionCmd !== 'upload') {
+            throw new Error("supported commands for session: download upload")
+        }
+        if (!groups?.length) {
+            throw new Error("requires groups to be sync")
+        }
+        await sessionOperation({
+            cmd: sessionCmd,
+            groups: groups?.[0] === 'all' ? undefined : groups,
+            renewAll: options?.renew,
+        })
     } else if (["terminate", "resume", "list", "pause", "show"].includes(cmd)) {
         const { groups, actualMode } = parseCmdArgs()
         await syncCmd(cmd, groups, { debug, mode: actualMode })

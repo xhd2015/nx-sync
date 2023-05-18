@@ -6,8 +6,9 @@ import { Mode, SyncConfig, SyncOptions } from "./types"
 import { run } from "@node-ext/cmd"
 import { resolveShellPath } from "@node-ext/env"
 import { locked } from "@node-ext/lock"
-import { mkdir, readFile, writeFile } from "fs/promises"
+import { mkdir, readFile, writeFile, stat } from "fs/promises"
 import { dirname } from "path"
+import * as moment from "moment"
 
 export const StatusWatching = 'Watching for changes'
 export const StatusPaused = '[Paused]'
@@ -281,6 +282,7 @@ ${ignoreOpts}  --watch-polling-interval-alpha=${opts.watchPollingIntervalAlpha} 
   `
 }
 
+// parse groups, if groups is undefined, all configs are returned
 export function forEachSync<T>(groups: string[] | undefined, fn: (conf: SyncConfig) => T): T[] {
   const res: T[] = []
   for (const conf of syncConfigs) {
@@ -344,18 +346,6 @@ export async function syncCmd(cmd: string, groups?: string[], opts?: CmdOptions)
   run(`mutagen sync ${cmd} ${liveNames.map(e => normalizeMutagenName(e)).join(" ")}`, { debug: opts?.debug })
 }
 
-export interface RecreateOptions {
-  // cmd: "flush" | "terminate" | "list"
-  debug?: boolean
-  forceUnlock?: boolean
-  pause?: boolean // default true
-
-  forceRecreate?: boolean
-  pauseAfterSync?: boolean // default true
-  terminateAfterSync?: boolean
-  mode?: Mode
-}
-
 function checkModeDisabled(conf: SyncConfig, mode: Mode): boolean {
   if (!mode) {
     return false
@@ -364,6 +354,23 @@ function checkModeDisabled(conf: SyncConfig, mode: Mode): boolean {
     return true
   }
   return false
+}
+
+export interface RecreateOptions {
+  // cmd: "flush" | "terminate" | "list"
+  debug?: boolean
+  forceUnlock?: boolean
+  pause?: boolean // default true
+
+  // if the target sync already exists, termiante it and recreate it
+  forceRecreate?: boolean
+
+  pauseAfterSync?: boolean // default true
+  terminateAfterSync?: boolean
+  mode?: Mode
+
+  silentSyncError?: boolean
+  onSyncStatusUpdate?: (name: string, stage: Stage, err: Error) => Promise<void>
 }
 
 // no overhead
@@ -381,11 +388,13 @@ export async function recreateAndSync(groups?: string[], opts?: RecreateOptions)
 
   const stopActions: (() => Promise<void>)[] = []
   let names: string[] = []
+  const namesToConf: { [name: string]: SyncConfig } = {}
 
   const doSyncLocked = async (conf: SyncConfig, actualConfName: string) => {
     const syncInfo = syncMapping[normalizeMutagenName(actualConfName)] || { name: normalizeMutagenName(actualConfName), status: StatusNotExists } as SyncInfo
     console.log(`flushing ${actualConfName}`)
     names.push(actualConfName)
+    namesToConf[actualConfName] = conf
 
     // will resume or create
     await createSync(actualConfName, conf.srcDir, conf.dstDir, {
@@ -442,10 +451,22 @@ export async function recreateAndSync(groups?: string[], opts?: RecreateOptions)
 
     try {
       count++
-
       // console.log("sync:", conf)
       const ok = await locked(resolveShellPath(`~/.nx-sync/${actualConfName}`), 5 * 60 * 1000, opts?.forceUnlock, async locker => {
-        await doSyncLocked(conf, actualConfName)
+        let err: Error
+        await doSyncLocked(conf, actualConfName).catch(e => err = e)
+        if (err) {
+          if (opts?.onSyncStatusUpdate) {
+            await opts.onSyncStatusUpdate(conf.name, "init", err)
+          }
+          if (!opts.silentSyncError) {
+            throw err
+          }
+        } else {
+          if (opts?.onSyncStatusUpdate) {
+            await opts.onSyncStatusUpdate(conf.name, "flusing", undefined)
+          }
+        }
       })
       if (!ok) {
         console.log(`another sync session is running, skipped: ${actualConfName}`)
@@ -493,14 +514,25 @@ export async function recreateAndSync(groups?: string[], opts?: RecreateOptions)
     const checkAllTaskDone = async (): Promise<boolean> => {
       const syncMapping = await listSyncMapping()
       // console.log("check syncMapping:", syncMapping)
+      let allDone = true
       for (let name of names) {
         const status = syncMapping?.[normalizeMutagenName(name)]?.status
         if (syncMapping?.[normalizeMutagenName(name)]?.status !== StatusWatching) {
           console.log(`still working ${name}: ${status}`)
-          return false
+          allDone = false
+          if (!opts?.onSyncStatusUpdate) {
+            return false
+          }
+          continue
+        }
+        if (opts?.onSyncStatusUpdate) {
+          const confName = namesToConf[name]?.name
+          if (confName) {
+            await opts.onSyncStatusUpdate(confName, "done", undefined)
+          }
         }
       }
-      return true
+      return allDone
     }
 
     let i = 0
@@ -525,4 +557,145 @@ export async function recreateAndSync(groups?: string[], opts?: RecreateOptions)
   clearTimeout(timeoutTask)
 
   await Promise.all(stopActions.map(stop => stop()))
+}
+
+export type Stage = "init" | "flusing" | "done" | "error"
+
+export type SyncStatusMapping = { [name: string]: Stage }
+export interface SessionConfig {
+  cmd: "upload" | "download"
+  groups: string[] | undefined
+  createTime: string
+  updateTime: string
+  syncStatus: SyncStatusMapping
+}
+
+function formatTime(d: Date): string {
+  return moment(d).format(`${moment.HTML5_FMT.DATE} ${moment.HTML5_FMT.TIME_SECONDS}`)
+}
+const modes: { [cmd: string]: Mode } = {
+  "upload": "alpha-replica",
+  "download": "beta-replica",
+}
+export interface SessionOpts {
+  cmd: SessionCommand
+  groups: string[] | undefined
+  renewAll?: boolean
+}
+
+export type SessionCommand = "upload" | "download"
+
+export function getSessionConfigFile(): string {
+  return resolveShellPath(`~/.nx-sync/session.json`)
+}
+
+export async function readJSONOptional<T>(file: string): Promise<T> {
+  const content = await readFile(file, { encoding: 'utf-8' }).catch(e => { })
+  if (content) {
+    try {
+      return JSON.parse(content)
+    } catch (e) { }
+  }
+}
+export async function sessionOperation(opts: SessionOpts) {
+  if (opts.cmd !== 'upload' && opts?.cmd !== 'download') {
+    throw new Error(`invalid session cmd: ${opts.cmd}`)
+  }
+  const mode = modes[opts.cmd]
+  if (!mode) {
+    throw new Error(`invalid session cmd: ${opts.cmd}`)
+  }
+  const ok = await locked(resolveShellPath(`~/.nx-sync/session.lock`), 5 * 60 * 1000, false, async locker => {
+    const sessionConfFile = getSessionConfigFile()
+    let config = await readJSONOptional<SessionConfig>(sessionConfFile)
+    let shouldRenew = false
+    if (!config || !config.cmd) {
+      shouldRenew = true
+    } else if (config.cmd !== opts.cmd) {
+      const keys = Object.keys(config?.syncStatus || {})
+      const notDoneKeys = []
+      for (const key of keys) {
+        if (config.syncStatus[key] !== 'done') {
+          notDoneKeys.push(key)
+        }
+      }
+      if (notDoneKeys.length) {
+        throw new Error(`previous session ${config.cmd} not complete:${notDoneKeys.join(",")}`)
+      }
+      console.log(`session command changed: ${config.cmd} -> ${opts.cmd}`)
+      shouldRenew = true
+    } else if (opts?.renewAll) {
+      shouldRenew = true
+    } else {
+      const prev = JSON.stringify(config.groups)
+      const cur = JSON.stringify(opts?.groups)
+      if (prev !== cur) {
+        shouldRenew = true
+      }
+    }
+    if (shouldRenew) {
+      const statusMapping: SyncStatusMapping = {}
+      forEachSync(opts?.groups, conf => {
+        const actualConfName = resolveActualName(conf.name, mode)
+        if (checkModeDisabled(conf, mode)) {
+          console.log(`${actualConfName} skipped because disabled`)
+          return
+        }
+        statusMapping[conf.name] = "init"
+      })
+      // create new config
+      const createTime = formatTime(new Date())
+      config = {
+        cmd: opts.cmd,
+        createTime,
+        updateTime: createTime,
+        groups: opts?.groups,
+        syncStatus: statusMapping,
+      }
+      await writeFile(sessionConfFile, JSON.stringify(config, null, "    "), { encoding: 'utf-8' })
+    }
+
+    // for all status not done, refresh them step by step
+    const keys = Object.keys(config.syncStatus || {})
+    if (keys?.length === 0) {
+      console.log("NOTE: no groups found")
+    }
+    const todoKeys = []
+    for (const key of keys) {
+      if (config.syncStatus[key] === 'done') {
+        continue
+      }
+      todoKeys.push(key)
+    }
+    if (!todoKeys.length) {
+      console.log(`session ${opts.cmd} all done, add --renew if you want to restart all`)
+      return
+    }
+    await recreateAndSync(todoKeys, {
+      mode: mode,
+      forceUnlock: true,
+      pause: true,
+      silentSyncError: true,
+      async onSyncStatusUpdate(name, stage, err) {
+        if (!(name in config.syncStatus)) {
+          throw new Error(`unexpected config name: ${name}`)
+        }
+        if (err) {
+          stage = "error"
+        }
+        config.syncStatus[name] = stage
+        config.updateTime = formatTime(new Date())
+        await writeFile(sessionConfFile, JSON.stringify(config, null, "    "), { encoding: 'utf-8' })
+      },
+    })
+  })
+  if (!ok) {
+    console.log(`another session command is running, skip`)
+  }
+}
+
+export async function sessionStatus() {
+  const file = getSessionConfigFile()
+  let config = await readJSONOptional<SessionConfig>(file)
+  console.log(JSON.stringify(config, undefined, "    "))
 }
