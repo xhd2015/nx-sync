@@ -21,7 +21,7 @@ export function setSyncConfigs(e: SyncConfig[]) {
 }
 
 export interface SyncInfo {
-  name: string
+  name: SyncName
   identifier: string
   status: SyncStatus
 }
@@ -34,11 +34,11 @@ export interface CreateSyncOptions extends SyncOptions {
 }
 
 // mutagen name cannot contain _
-export function normalizeMutagenName(name: string): string {
-  return name.replaceAll("_", "-")
+export function normalizeMutagenName(name: SyncName): string {
+  return (name as string).replaceAll("_", "-")
 }
 
-export async function createSync(actualName: string, srcDir: string, dstDir: string, options?: CreateSyncOptions) {
+export async function createSync(actualName: SyncName, srcDir: string, dstDir: string, options?: CreateSyncOptions) {
   if (!actualName) {
     throw new Error("create sync requires name")
   }
@@ -111,17 +111,17 @@ export async function createSync(actualName: string, srcDir: string, dstDir: str
   }
 }
 
-export async function flushSync(name: string) {
+export async function flushSync(name: SyncName) {
   await run(`mutagen sync flush ${normalizeMutagenName(name)}`)
 }
 
-export async function terminateSync(name: string) {
+export async function terminateSync(name: SyncName) {
   await run(`mutagen sync terminate ${normalizeMutagenName(name)} || true`)
 }
-export async function pauseSync(name: string) {
+export async function pauseSync(name: SyncName) {
   await run(`mutagen sync pause ${normalizeMutagenName(name)} || true`)
 }
-export async function resumeSync(name: string) {
+export async function resumeSync(name: SyncName) {
   await run(`mutagen sync resume ${normalizeMutagenName(name)} || true`)
 }
 
@@ -187,15 +187,15 @@ export async function listSync(): Promise<SyncInfo[]> {
 }
 
 
-export async function listSyncMapping(): Promise<{ [name: string]: SyncInfo }> {
+export async function listSyncMapping(): Promise<{ [name: SyncName]: SyncInfo }> {
   const sync = await listSync()
-  const mapping = {}
+  const mapping: { [name: SyncName]: SyncInfo } = {}
   sync?.forEach?.(e => {
     mapping[e.name] = e
   })
   return mapping
 }
-export async function getSyncInfo(name: string): Promise<SyncInfo | undefined> {
+export async function getSyncInfo(name: SyncName): Promise<SyncInfo | undefined> {
   const syncInfos = await listSync()
   for (const syncInfo of (syncInfos || [])) {
     if (syncInfo.name === normalizeMutagenName(name)) {
@@ -205,13 +205,16 @@ export async function getSyncInfo(name: string): Promise<SyncInfo | undefined> {
   return undefined
 }
 
-function resolveActualName(name: string, actualMode: CreateSyncOptions["actualMode"]): string {
+// adding a |0 making SyncName not only strings
+export type SyncName = string | number
+
+function resolveActualName(name: string, actualMode: CreateSyncOptions["actualMode"]): SyncName {
   if (!actualMode) {
     return name
   }
   return name + "-" + actualMode
 }
-function formatCreateSyncCommand(actualName: string, srcDir: string, dstDir: string, options?: CreateSyncOptions): string {
+function formatCreateSyncCommand(actualName: SyncName, srcDir: string, dstDir: string, options?: CreateSyncOptions): string {
   if (!actualName) {
     throw new Error("requries name")
   }
@@ -315,7 +318,7 @@ export async function syncCmd(cmd: string, groups?: string[], opts?: CmdOptions)
     throw new Error("requires sync cmd")
   }
   validateMode(opts?.mode)
-  const names: string[] = []
+  const names: SyncName[] = []
   forEachSync(groups, conf => {
     if (checkModeDisabled(conf, opts?.mode)) {
       return
@@ -369,6 +372,10 @@ export interface RecreateOptions {
   terminateAfterSync?: boolean
   mode?: Mode
 
+  // terminate the mode before doing
+  // next way
+  terminateMode?: Mode
+
   silentSyncError?: boolean
   onSyncStatusUpdate?: (name: string, stage: Stage, err: Error) => Promise<void>
 }
@@ -387,10 +394,10 @@ export async function recreateAndSync(groups?: string[], opts?: RecreateOptions)
   const syncMapping = syncs?.reduce?.((prev, e) => ({ ...prev, [e.name]: e }), {})
 
   const stopActions: (() => Promise<void>)[] = []
-  let names: string[] = []
-  const namesToConf: { [name: string]: SyncConfig } = {}
+  let names: SyncName[] = []
+  const namesToConf: { [name: SyncName]: SyncConfig } = {}
 
-  const doSyncLocked = async (conf: SyncConfig, actualConfName: string) => {
+  const doSyncLocked = async (conf: SyncConfig, actualConfName: SyncName) => {
     const syncInfo = syncMapping[normalizeMutagenName(actualConfName)] || { name: normalizeMutagenName(actualConfName), status: StatusNotExists } as SyncInfo
     console.log(`flushing ${actualConfName}`)
     names.push(actualConfName)
@@ -411,6 +418,7 @@ export async function recreateAndSync(groups?: string[], opts?: RecreateOptions)
     if (!endMode) {
       return
     }
+
     stopActions.push(async () => {
       // stop it so that does not affect normal work
       if (endMode === "terminate") {
@@ -453,11 +461,15 @@ export async function recreateAndSync(groups?: string[], opts?: RecreateOptions)
       count++
       // console.log("sync:", conf)
       const ok = await locked(resolveShellPath(`~/.nx-sync/${actualConfName}`), 5 * 60 * 1000, opts?.forceUnlock, async locker => {
+        if (opts?.terminateMode) {
+          const terminateBeforeSync = resolveActualName(conf.name, opts?.terminateMode)
+          await terminateSync(terminateBeforeSync)
+        }
         let err: Error
         await doSyncLocked(conf, actualConfName).catch(e => err = e)
         if (err) {
           if (opts?.onSyncStatusUpdate) {
-            await opts.onSyncStatusUpdate(conf.name, "init", err)
+            await opts.onSyncStatusUpdate(conf.name, "error", err)
           }
           if (!opts.silentSyncError) {
             throw err
@@ -510,6 +522,7 @@ export async function recreateAndSync(groups?: string[], opts?: RecreateOptions)
   })
 
   let checkTask
+  const okTimes: { [name: SyncName]: number } = {}
   const checkAllTaskDonePromise = new Promise(resolve => {
     const checkAllTaskDone = async (): Promise<boolean> => {
       const syncMapping = await listSyncMapping()
@@ -517,7 +530,9 @@ export async function recreateAndSync(groups?: string[], opts?: RecreateOptions)
       let allDone = true
       for (let name of names) {
         const status = syncMapping?.[normalizeMutagenName(name)]?.status
-        if (syncMapping?.[normalizeMutagenName(name)]?.status !== StatusWatching) {
+        if (status !== StatusWatching) {
+          // reset ok
+          okTimes[name] = 0
           console.log(`still working ${name}: ${status}`)
           allDone = false
           if (!opts?.onSyncStatusUpdate) {
@@ -525,7 +540,8 @@ export async function recreateAndSync(groups?: string[], opts?: RecreateOptions)
           }
           continue
         }
-        if (opts?.onSyncStatusUpdate) {
+        okTimes[name] = (okTimes[name] || 0) + 1
+        if (okTimes[name] >= 5 && opts?.onSyncStatusUpdate) {
           const confName = namesToConf[name]?.name
           if (confName) {
             await opts.onSyncStatusUpdate(confName, "done", undefined)
@@ -535,16 +551,20 @@ export async function recreateAndSync(groups?: string[], opts?: RecreateOptions)
       return allDone
     }
 
+    // every 2s, for 10s
     let i = 0
     checkTask = setInterval(() => {
       checkAllTaskDone().then(done => {
-        if (done) {
-          i++
-          // at least 5 times
-          if (i >= 5) {
-            console.log("\nall task done")
-            resolve(true)
-          }
+        if (!done) {
+          // reset
+          i = 0
+          return
+        }
+        i++
+        // at least 5 times
+        if (i >= 5) {
+          console.log("\nall task done")
+          resolve(true)
         }
       }).catch(e => {/*ignore*/ })
     }, 2 * 1000)
@@ -577,6 +597,7 @@ const modes: { [cmd: string]: Mode } = {
   "upload": "alpha-replica",
   "download": "beta-replica",
 }
+
 export interface SessionOpts {
   cmd: SessionCommand
   groups: string[] | undefined
@@ -603,6 +624,11 @@ export async function sessionOperation(opts: SessionOpts) {
   }
   const mode = modes[opts.cmd]
   if (!mode) {
+    throw new Error(`invalid session cmd: ${opts.cmd}`)
+  }
+  const revCmd = opts?.cmd === 'upload' ? 'download' : 'upload'
+  const terminateMode = modes[revCmd]
+  if (!terminateMode) {
     throw new Error(`invalid session cmd: ${opts.cmd}`)
   }
   const ok = await locked(resolveShellPath(`~/.nx-sync/session.lock`), 5 * 60 * 1000, false, async locker => {
@@ -673,6 +699,7 @@ export async function sessionOperation(opts: SessionOpts) {
     }
     await recreateAndSync(todoKeys, {
       mode: mode,
+      terminateMode,
       forceUnlock: true,
       pause: true,
       silentSyncError: true,

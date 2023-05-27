@@ -1,4 +1,5 @@
 import { getRemoteDir } from "./config";
+import { makeHomeSyncConfigs } from "./list-common";
 import { SyncConfig, SyncOptions } from "./types";
 
 export function makeDir(srcPath: string): { srcDir: string, dstDir: string } {
@@ -31,19 +32,8 @@ const syncConfigs: SyncConfig[] = [
         },
         groups: ["core", "working", "example"],
     },
-    {
-        name: "home",
-        srcDir: `~/`,
-        dstDir: `${remoteHome}/home_bak/`,
-        options: {
-            mode: "one-way-replica",
-            ignores: ["*",
-                ...[".bash_profile", ".bashrc", ".bash_history", ".bash_sessions", ".profile", ".bash_alias", ".vim", ".viminfo", ".vimrc", ".gitconfig", ".ssh"].map(e => `!/${e}`)
-            ],
-        },
-        disableMode: ["beta-replica", "beta-to-alpha"],
-        groups: ["core", "working", "home"],
-    },
+
+    ...makeHomeSyncConfigs(remoteHome, "home_bak")
 ]
 
 const working = [
